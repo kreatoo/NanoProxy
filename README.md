@@ -1,20 +1,19 @@
-# Tool Proxy
+# Nano Proxy
 
-OpenAI-compatible local proxy for sitting between OpenCode and NanoGPT.
+Local OpenAI-compatible proxy for OpenCode and similar coding clients when NanoGPT native tool calling is unreliable.
 
-Current mode is a proxy-managed tool bridge:
+What it does:
 
-- OpenCode still sends normal OpenAI `tools`
+- the client still sends normal OpenAI-style `tools`
 - the proxy strips native tool calling before forwarding upstream
-- the proxy injects a strict text tool protocol into the prompt
-- the model replies in that text protocol
-- the proxy converts that reply back into real OpenAI `tool_calls`
+- the proxy makes the model use a stricter text-based tool format instead
+- the proxy converts that back into normal OpenAI-style `tool_calls` for the client
 
-This bypasses unreliable native tool calling upstream while preserving the normal tool interface downstream.
+So the client still sees normal tool calls, but NanoGPT does not have to rely on its native tool-calling behavior.
 
 ## Quick Start
 
-1. Extract the proxy files into a folder.
+1. Put these files in a folder.
 2. Open a terminal in that folder.
 3. Start the proxy:
 
@@ -22,13 +21,21 @@ This bypasses unreliable native tool calling upstream while preserving the norma
 node server.js
 ```
 
-4. In OpenCode, point the provider base URL to:
+4. In OpenCode, create a custom OpenAI-compatible provider that points to:
 
 ```text
 http://127.0.0.1:8787
 ```
 
-5. Keep using your normal NanoGPT API key and model selection in OpenCode.
+5. Set your NanoGPT API key on that custom provider.
+6. Add or select the model you want on that custom provider.
+7. Restart OpenCode if needed.
+
+Important:
+
+- do not use the built-in NanoGPT provider directly with the proxy
+- the proxy only forwards the auth header it receives
+- your API key must be configured on the custom provider that points to `http://127.0.0.1:8787`
 
 ## Optional Overrides
 
@@ -83,6 +90,7 @@ done
 - Requests without `tools` are forwarded normally.
 - For bridged tool turns, the proxy caps upstream `temperature` and `top_p` to reduce protocol drift.
 - This share version does not write request or stream logs.
+- This proxy currently targets OpenAI-compatible `chat/completions` style tool clients.
 
 ## Verification
 

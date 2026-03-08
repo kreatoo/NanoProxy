@@ -1,6 +1,6 @@
 {
   "name": "opencode-nanogpt-tool-bridge",
-  "private": true,
+  "private": false,
   "version": "1.0.0",
   "description": "Local OpenAI-compatible proxy that bridges OpenCode tool calls for NanoGPT when native tool calling is unreliable.",
   "scripts": {
