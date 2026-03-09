@@ -248,6 +248,43 @@ function salvageTodowriteArguments(argumentsText) {
   return todos.length > 0 ? { todos } : null;
 }
 
+function extractJsonLikeStringField(text, fieldName) {
+  const source = String(text || "");
+  const fieldRegex = new RegExp(`"${fieldName}"\\s*:\\s*"`, "i");
+  const match = fieldRegex.exec(source);
+  if (!match) return null;
+  let i = match.index + match[0].length;
+  let out = "";
+  let escaped = false;
+  for (; i < source.length; i++) {
+    const char = source[i];
+    if (escaped) {
+      out += char;
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      out += char;
+      escaped = true;
+      continue;
+    }
+    if (char === "\"") {
+      return decodeJsonStringLiteral(out);
+    }
+    out += char;
+  }
+  return decodeJsonStringLiteral(out);
+}
+
+function salvageWriteArguments(argumentsText) {
+  const filePath = extractJsonLikeStringField(argumentsText, "filePath");
+  const content = extractJsonLikeStringField(argumentsText, "content");
+  if (typeof filePath === "string" && filePath.length > 0 && typeof content === "string") {
+    return { filePath, content };
+  }
+  return null;
+}
+
 function salvageMalformedToolCalls(text) {
   const source = String(text || "");
   const calls = [];
@@ -268,6 +305,10 @@ function salvageMalformedToolCalls(text) {
         const parsedArgs = tryParseJsonLenient(argsObjectText);
         if (parsedArgs.ok) {
           argsValue = parsedArgs.value;
+        } else if (name === "write") {
+          const salvaged = salvageWriteArguments(argsObjectText);
+          if (salvaged) argsValue = salvaged;
+          else continue;
         } else if (name === "todowrite") {
           const salvaged = salvageTodowriteArguments(argsObjectText);
           if (salvaged) argsValue = salvaged;
@@ -287,9 +328,124 @@ function salvageMalformedToolCalls(text) {
   return calls.length > 0 ? calls : null;
 }
 
+function parseInlineBridgeScalar(value) {
+  const raw = String(value || "").replace(/^\s+/, "");
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  if (trimmed === "true") return true;
+  if (trimmed === "false") return false;
+  if (trimmed === "null") return null;
+  if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) return Number(trimmed);
+  return raw;
+}
+
+function canonicalStructuredFieldName(name) {
+  const raw = String(name || "").trim();
+  const lower = raw.toLowerCase();
+  if (lower === "tool") return "name";
+  if (lower === "filepath" || lower === "file" || lower === "path" || lower === "filename") return "filePath";
+  if (lower === "oldstring") return "oldString";
+  if (lower === "newstring") return "newString";
+  return raw;
+}
+
+function isStructuredMultilineField(name) {
+  return new Set(["content", "oldString", "newString"]).has(String(name || ""));
+}
+
+function looksLikeStructuredFieldLine(line) {
+  return /^([A-Za-z_][A-Za-z0-9_-]*)\s*(<<\s*[A-Za-z0-9_-]+|:\s*[\s\S]*)$/.test(String(line || "").trim());
+}
+
+function parseStructuredCallBlock(text) {
+  const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");
+  let index = 0;
+  while (index < lines.length && !lines[index].trim()) index++;
+  if (index >= lines.length) return null;
+
+  let name = "";
+  const args = {};
+
+  while (index < lines.length) {
+    const rawLine = lines[index];
+    const line = rawLine.trim();
+    index++;
+    if (!line) continue;
+
+    const heredocMatch = /^([A-Za-z_][A-Za-z0-9_-]*)\s*<<\s*([A-Za-z0-9_-]+)\s*$/.exec(line);
+    if (heredocMatch) {
+      const field = canonicalStructuredFieldName(heredocMatch[1]);
+      const terminator = heredocMatch[2];
+      const valueLines = [];
+      while (index < lines.length && lines[index].trim() !== terminator) {
+        valueLines.push(lines[index]);
+        index++;
+      }
+      if (index < lines.length && lines[index].trim() === terminator) index++;
+      const value = valueLines.join("\n");
+      if (field === "name" || field === "tool") {
+        name = value.trim();
+      } else if (field === "args_json" || field === "arguments_json") {
+        const parsed = tryParseJsonLenient(value);
+        if (parsed.ok && parsed.value && typeof parsed.value === "object" && !Array.isArray(parsed.value)) {
+          Object.assign(args, parsed.value);
+        }
+      } else if (field.endsWith("_json")) {
+        const parsed = tryParseJsonLenient(value);
+        args[field.slice(0, -5)] = parsed.ok ? parsed.value : value;
+      } else {
+        args[field] = value;
+      }
+      continue;
+    }
+
+    const fieldMatch = /^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*([\s\S]*)$/.exec(rawLine);
+    if (!fieldMatch) continue;
+    const field = canonicalStructuredFieldName(fieldMatch[1]);
+    const rawValue = fieldMatch[2];
+    if (field === "name" || field === "tool") {
+      name = rawValue.trim();
+      continue;
+    }
+    if (field === "args_json" || field === "arguments_json") {
+      const parsed = tryParseJsonLenient(rawValue);
+      if (parsed.ok && parsed.value && typeof parsed.value === "object" && !Array.isArray(parsed.value)) {
+        Object.assign(args, parsed.value);
+      }
+      continue;
+    }
+    if (field.endsWith("_json")) {
+      const parsed = tryParseJsonLenient(rawValue);
+      args[field.slice(0, -5)] = parsed.ok ? parsed.value : parseInlineBridgeScalar(rawValue);
+      continue;
+    }
+    if (isStructuredMultilineField(field)) {
+      const valueLines = [rawValue];
+      while (index < lines.length) {
+        const nextRaw = lines[index];
+        if (looksLikeStructuredFieldLine(nextRaw)) break;
+        valueLines.push(nextRaw);
+        index++;
+      }
+      args[field] = valueLines.join("\n");
+      continue;
+    }
+    args[field] = parseInlineBridgeScalar(rawValue);
+  }
+
+  if (!name) return null;
+  return [{ name, arguments: args }];
+}
+
 function bestEffortParseToolPayload(text) {
   const source = String(text || "").trim();
   const wrappedSource = /^[{\[]/.test(source) ? source : `{${source}}`;
+
+  const structuredCalls = parseStructuredCallBlock(source);
+  if (structuredCalls) {
+    const toolCalls = normalizeParsedToolCalls(structuredCalls);
+    if (toolCalls.length > 0) return toolCalls;
+  }
 
   const parsed = tryParseJsonLenient(source);
   if (parsed.ok && parsed.value && typeof parsed.value === "object") {
@@ -479,15 +635,9 @@ function buildEmptyStopRecoveryRequest(upstreamRequest) {
 
 function encodeToolCallsBlock(toolCalls) {
   const callBlocks = toolCalls.map((call) => {
-    const payload = {
-      name: call.function.name,
-      arguments: typeof call.function.arguments === "string"
-        ? (tryParseJson(call.function.arguments).ok ? tryParseJson(call.function.arguments).value : call.function.arguments)
-        : (call.function.arguments || {})
-    };
     return [
       CALL_MODE_MARKER,
-      JSON.stringify(payload, null, 2),
+      encodeStructuredCallPayload(call),
       CALL_MODE_END_MARKER
     ].join("\n");
   });
@@ -530,7 +680,8 @@ function encodeUserMessageForBridge(content, options = {}) {
     "Protocol requirements for your next reply:",
     `- Start with ${TOOL_MODE_MARKER} or ${FINAL_MODE_MARKER}.`,
     `- If you need to inspect, search, read, edit, write, or plan work, reply with ${TOOL_MODE_MARKER}.`,
-    `- Inside ${TOOL_MODE_MARKER}, only use ${CALL_MODE_MARKER} JSON ${CALL_MODE_END_MARKER}.`,
+    `- Inside ${TOOL_MODE_MARKER}, only use ${CALL_MODE_MARKER} ... ${CALL_MODE_END_MARKER}.`,
+    "- Preferred CALL format is field-based: name line plus argument lines. Use HEREDOC blocks for long text fields like content, oldString, and newString.",
     "- If you genuinely need clarification before acting, prefer the question tool instead of guessing.",
     "- Do not use [question], [write], [read], or any other bracketed legacy tool format.",
     "- Do not narrate what you are about to do in plain text.",
@@ -554,13 +705,20 @@ function buildBridgeSystemMessage(tools) {
     "Tool format example:",
     TOOL_MODE_MARKER,
     CALL_MODE_MARKER,
-    JSON.stringify({ name: "tool_name", arguments: { example: true } }, null, 2),
+    "name: tool_name",
+    "example_json: true",
     CALL_MODE_END_MARKER,
     TOOL_MODE_END_MARKER,
-    "Inside the tool envelope, emit one or more CALL blocks. Each CALL block contains one tool call as JSON.",
+    "Inside the tool envelope, emit one or more CALL blocks. Each CALL block contains one tool call.",
     "Rules for tool use:",
     `- Output ${TOOL_MODE_MARKER} first and ${TOOL_MODE_END_MARKER} last.`,
     `- For each tool call, wrap it in ${CALL_MODE_MARKER} and ${CALL_MODE_END_MARKER}.`,
+    "- Preferred CALL body format is line-based fields, not a giant escaped JSON string.",
+    "- Use name: TOOL_NAME on the first non-empty line of each CALL block.",
+    "- Use ARGUMENT_NAME: value for short scalar arguments.",
+    "- Use ARGUMENT_NAME<<TAG ... TAG for long multiline text fields like content, oldString, and newString.",
+    "- For nested or non-string arguments, use field_json: VALUE or field_json<<TAG ... TAG with valid JSON.",
+    "- The older JSON CALL body shape is still accepted as a compatibility fallback. Prefer the field-based format.",
     "- Do not use markdown code fences for tool replies.",
     "- Do not write any explanatory prose before, inside, or after the tool envelope.",
     "- Do not use legacy bracketed formats like [question], [write], [read], or [toolname].",
@@ -582,16 +740,29 @@ function buildBridgeSystemMessage(tools) {
     "Valid response example:",
     TOOL_MODE_MARKER,
     CALL_MODE_MARKER,
-    JSON.stringify({ name: "read", arguments: { filePath: "src/app.js" } }, null, 2),
+    "name: read",
+    "filePath: src/app.js",
     CALL_MODE_END_MARKER,
     TOOL_MODE_END_MARKER,
     "Valid multi-tool example:",
     TOOL_MODE_MARKER,
     CALL_MODE_MARKER,
-    JSON.stringify({ name: "read", arguments: { filePath: "src/app.js" } }, null, 2),
+    "name: read",
+    "filePath: src/app.js",
     CALL_MODE_END_MARKER,
     CALL_MODE_MARKER,
-    JSON.stringify({ name: "read", arguments: { filePath: "src/styles.css" } }, null, 2),
+    "name: read",
+    "filePath: src/styles.css",
+    CALL_MODE_END_MARKER,
+    TOOL_MODE_END_MARKER,
+    "Valid large write example:",
+    TOOL_MODE_MARKER,
+    CALL_MODE_MARKER,
+    "name: write",
+    "filePath: src/app.js",
+    "content<<CONTENT",
+    "console.log('hello');",
+    "CONTENT",
     CALL_MODE_END_MARKER,
     TOOL_MODE_END_MARKER,
     `If you are giving a final answer to the user and no tool is needed, use this exact envelope:`,
@@ -699,6 +870,48 @@ function transformRequestForBridge(body) {
 
 function generateToolCallId() {
   return `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+}
+
+function pickHeredocTerminator(text, base) {
+  const source = String(text || "");
+  let candidate = base;
+  let counter = 1;
+  while (source.includes(`\n${candidate}\n`) || source.endsWith(`\n${candidate}`) || source === candidate) {
+    counter++;
+    candidate = `${base}_${counter}`;
+  }
+  return candidate;
+}
+
+function encodeStructuredCallPayload(call) {
+  const exactTextFields = new Set(["content", "oldString", "newString"]);
+  const args = typeof call.function.arguments === "string"
+    ? (tryParseJson(call.function.arguments).ok ? tryParseJson(call.function.arguments).value : {})
+    : (call.function.arguments || {});
+  const lines = [`name: ${call.function.name}`];
+  for (const [key, value] of Object.entries(args || {})) {
+    if (typeof value === "string") {
+      if (exactTextFields.has(key) || value.includes("\n") || value.length > 160 || /^\s|\s$/.test(value)) {
+        const terminator = pickHeredocTerminator(value, key.toUpperCase());
+        lines.push(`${key}<<${terminator}`);
+        lines.push(value);
+        lines.push(terminator);
+      } else {
+        lines.push(`${key}: ${value}`);
+      }
+      continue;
+    }
+    if (value && typeof value === "object") {
+      const encoded = JSON.stringify(value, null, 2);
+      const terminator = pickHeredocTerminator(encoded, `${key.toUpperCase()}_JSON`);
+      lines.push(`${key}_json<<${terminator}`);
+      lines.push(encoded);
+      lines.push(terminator);
+      continue;
+    }
+    lines.push(`${key}_json: ${JSON.stringify(value)}`);
+  }
+  return lines.join("\n");
 }
 
 function extractFencedBlock(text, label) {

@@ -101,7 +101,11 @@ Tool use:
 ```text
 [[OPENCODE_TOOL]]
 [[CALL]]
-{"name":"write","arguments":{"filePath":"a.txt","content":"hello"}}
+name: write
+filePath: a.txt
+content<<CONTENT
+hello
+CONTENT
 [[/CALL]]
 [[/OPENCODE_TOOL]]
 ```
@@ -111,10 +115,12 @@ Multiple tool calls in one turn are also allowed when they are independent:
 ```text
 [[OPENCODE_TOOL]]
 [[CALL]]
-{"name":"read","arguments":{"filePath":"src/app.js"}}
+name: read
+filePath: src/app.js
 [[/CALL]]
 [[CALL]]
-{"name":"read","arguments":{"filePath":"src/styles.css"}}
+name: read
+filePath: src/styles.css
 [[/CALL]]
 [[/OPENCODE_TOOL]]
 ```
@@ -128,7 +134,8 @@ done
 ```
 
 6. The proxy parses that envelope and converts it into OpenAI-style `tool_calls` for OpenCode.
-7. The older `{"tool_calls":[...]}` JSON shape is still accepted for compatibility, but explicit `[[CALL]]` blocks are preferred.
+7. The preferred CALL body format is field-based with heredoc-style blocks for large text payloads like `content`, `oldString`, and `newString`.
+8. Older JSON CALL bodies and the older `{"tool_calls":[...]}` shape are still accepted for compatibility.
 
 ## Notes
 

@@ -44,6 +44,8 @@ function run() {
   assert.match(request.rewritten.messages[1].content, /\[\[\/OPENCODE_TOOL\]\]/);
   assert.match(request.rewritten.messages[1].content, /\[\[CALL\]\]/);
   assert.match(request.rewritten.messages[1].content, /\[\[\/CALL\]\]/);
+  assert.match(request.rewritten.messages[1].content, /Preferred CALL body format is line-based fields/);
+  assert.match(request.rewritten.messages[1].content, /content<<CONTENT/);
   assert.match(request.rewritten.messages[1].content, /Invalid response example/);
   assert.match(request.rewritten.messages[1].content, /Only two reply formats are valid/);
   assert.match(request.rewritten.messages[1].content, /Do not use legacy bracketed formats/);
@@ -53,6 +55,7 @@ function run() {
   assert.equal(request.rewritten.top_p, 0.3);
   assert.equal(request.rewritten.messages[2].role, "user");
   assert.match(request.rewritten.messages[2].content, /Protocol requirements for your next reply/);
+  assert.match(request.rewritten.messages[2].content, /Preferred CALL format is field-based/);
   assert.match(request.rewritten.messages[2].content, /prefer the question tool instead of guessing/);
   assert.match(request.rewritten.messages[2].content, /Do not use \[question\], \[write\], \[read\]/);
   assert.match(request.rewritten.messages[2].content, /concrete task/);
@@ -217,6 +220,30 @@ function run() {
   assert.equal(parsedCallMarker.kind, "tool_calls");
   assert.equal(parsedCallMarker.toolCalls[0].function.name, "write");
 
+  const parsedStructuredCallMarker = parseBridgeAssistantText(
+    "[[OPENCODE_TOOL]]\n[[CALL]]\nname: write\nfilePath: a.txt\ncontent<<CONTENT\nhello\nworld\nCONTENT\n[[/CALL]]\n[[/OPENCODE_TOOL]]"
+  );
+  assert.equal(parsedStructuredCallMarker.kind, "tool_calls");
+  assert.equal(parsedStructuredCallMarker.toolCalls[0].function.name, "write");
+  assert.equal(parsedStructuredCallMarker.toolCalls[0].function.arguments, JSON.stringify({ filePath: "a.txt", content: "hello\nworld" }));
+
+  const parsedStructuredInlineMultilineCallMarker = parseBridgeAssistantText(
+    "[[OPENCODE_TOOL]]\n[[CALL]]\nname: write\nfilePath: a.txt\ncontent: <!DOCTYPE html>\n<html>\n<body>Hello</body>\n</html>\n[[/CALL]]\n[[/OPENCODE_TOOL]]"
+  );
+  assert.equal(parsedStructuredInlineMultilineCallMarker.kind, "tool_calls");
+  assert.equal(parsedStructuredInlineMultilineCallMarker.toolCalls[0].function.name, "write");
+  assert.equal(
+    parsedStructuredInlineMultilineCallMarker.toolCalls[0].function.arguments,
+    JSON.stringify({ filePath: "a.txt", content: "<!DOCTYPE html>\n<html>\n<body>Hello</body>\n</html>" })
+  );
+
+  const parsedStructuredAliasedFieldCallMarker = parseBridgeAssistantText(
+    "[[OPENCODE_TOOL]]\n[[CALL]]\nname: write\npath: a.txt\ncontent: hello\n[[/CALL]]\n[[/OPENCODE_TOOL]]"
+  );
+  assert.equal(parsedStructuredAliasedFieldCallMarker.kind, "tool_calls");
+  assert.equal(parsedStructuredAliasedFieldCallMarker.toolCalls[0].function.name, "write");
+  assert.equal(parsedStructuredAliasedFieldCallMarker.toolCalls[0].function.arguments, JSON.stringify({ filePath: "a.txt", content: "hello" }));
+
   const parsedMultiCallMarker = parseBridgeAssistantText(
     "[[OPENCODE_TOOL]]\n[[CALL]]\n{\"name\":\"read\",\"arguments\":{\"filePath\":\"a.txt\"}}\n[[/CALL]]\n[[CALL]]\n{\"name\":\"read\",\"arguments\":{\"filePath\":\"b.txt\"}}\n[[/CALL]]\n[[/OPENCODE_TOOL]]"
   );
@@ -317,6 +344,14 @@ function run() {
   assert.match(parsedMalformedTodoWrite.toolCalls[0].function.arguments, /First task/);
   assert.match(parsedMalformedTodoWrite.toolCalls[0].function.arguments, /Third task/);
 
+  const parsedMalformedWrite = parseBridgeAssistantText(
+    "[[OPENCODE_TOOL]]\n[[CALL]]\n{\"name\":\"write\",\"arguments\":{\"filePath\":\"sidescroller_shooter.html\",\"content\":\"<!DOCTYPE html>\\n<html lang=\\\"en\\\">\\n<body>Hi\"\n[[/CALL]]\n[[/OPENCODE_TOOL]]"
+  );
+  assert.equal(parsedMalformedWrite.kind, "tool_calls");
+  assert.equal(parsedMalformedWrite.toolCalls[0].function.name, "write");
+  assert.match(parsedMalformedWrite.toolCalls[0].function.arguments, /sidescroller_shooter\.html/);
+  assert.match(parsedMalformedWrite.toolCalls[0].function.arguments, /DOCTYPE html/);
+
   const transcript = parseSSETranscript([
     'data: {"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"glm","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}',
     'data: {"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"glm","choices":[{"index":0,"delta":{"reasoning":"think"},"finish_reason":null}]}',
@@ -362,11 +397,23 @@ function run() {
   assert.equal(progressiveCallMarkers.length, 1);
   assert.equal(progressiveCallMarkers[0].function.name, "read");
 
+  const progressiveStructuredCallMarkers = extractProgressiveToolCalls(
+    '[[OPENCODE_TOOL]]\n[[CALL]]\nname: read\nfilePath: a.txt\n[[/CALL]]\n[[CALL]]\nname: read\nfilePath: b.txt'
+  );
+  assert.equal(progressiveStructuredCallMarkers.length, 1);
+  assert.equal(progressiveStructuredCallMarkers[0].function.name, "read");
+
   const progressiveClosedCallMarkers = extractProgressiveToolCalls(
     '[[OPENCODE_TOOL]]\n[[CALL]]\n{"name":"read","arguments":{"filePath":"a.txt"}}\n[[/CALL]]\n[[CALL]]\n{"name":"read","arguments":{"filePath":"b.txt"}}\n[[/CALL]]'
   );
   assert.equal(progressiveClosedCallMarkers.length, 2);
   assert.equal(progressiveClosedCallMarkers[1].function.name, "read");
+
+  const progressiveClosedStructuredCallMarkers = extractProgressiveToolCalls(
+    '[[OPENCODE_TOOL]]\n[[CALL]]\nname: read\nfilePath: a.txt\n[[/CALL]]\n[[CALL]]\nname: read\nfilePath: b.txt\n[[/CALL]]'
+  );
+  assert.equal(progressiveClosedStructuredCallMarkers.length, 2);
+  assert.equal(progressiveClosedStructuredCallMarkers[1].function.name, "read");
 
   const ignoresReasoningMarkers = buildBridgeResultFromText(
     "Normal final text.",
