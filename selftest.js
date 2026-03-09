@@ -47,11 +47,13 @@ function run() {
   assert.match(request.rewritten.messages[1].content, /Invalid response example/);
   assert.match(request.rewritten.messages[1].content, /Only two reply formats are valid/);
   assert.match(request.rewritten.messages[1].content, /Do not use legacy bracketed formats/);
+  assert.match(request.rewritten.messages[1].content, /use the question tool instead of inventing requirements/);
   assert.match(request.rewritten.messages[1].content, /\[question\] \{ \.\.\. \}/);
   assert.equal(request.rewritten.temperature, 0.2);
   assert.equal(request.rewritten.top_p, 0.3);
   assert.equal(request.rewritten.messages[2].role, "user");
   assert.match(request.rewritten.messages[2].content, /Protocol requirements for your next reply/);
+  assert.match(request.rewritten.messages[2].content, /prefer the question tool instead of guessing/);
   assert.match(request.rewritten.messages[2].content, /Do not use \[question\], \[write\], \[read\]/);
   assert.match(request.rewritten.messages[2].content, /concrete task/);
   assert.match(request.rewritten.messages[2].content, /generic greeting or conversation opener/);
@@ -80,6 +82,7 @@ function run() {
   assert.match(bridgedToolResultMessage.content, /Do not narrate the next step in plain text/);
   assert.match(bridgedToolResultMessage.content, /multiple CALL blocks/);
   assert.match(bridgedToolResultMessage.content, /Do not use legacy forms like \[question\]/);
+  assert.match(bridgedToolResultMessage.content, /prefer the question tool instead of guessing/);
   const bridgedUserMessage = requestWithToolResult.rewritten.messages.find((msg) => msg.role === "user" && /Protocol requirements for your next reply/.test(msg.content || ""));
   assert.ok(bridgedUserMessage);
 
@@ -195,6 +198,12 @@ function run() {
   );
   assert.equal(parsedAnswerWrapper.kind, "final");
   assert.equal(parsedAnswerWrapper.content, "done");
+
+  const parsedEmbeddedFinalWithLeadingJunk = parseBridgeAssistantText(
+    "{\"content\":\"]\\nHello\"}"
+  );
+  assert.equal(parsedEmbeddedFinalWithLeadingJunk.kind, "final");
+  assert.equal(parsedEmbeddedFinalWithLeadingJunk.content, "Hello");
 
   const parsedToolMarker = parseBridgeAssistantText(
     "[[OPENCODE_TOOL]]\n{\"tool_calls\":[{\"name\":\"write\",\"arguments\":{\"filePath\":\"a.txt\",\"content\":\"z\"}}]}\n[[/OPENCODE_TOOL]]"
@@ -361,6 +370,10 @@ function run() {
   assert.equal(stillUsesContentMarkers.kind, "tool_calls");
   assert.equal(stillUsesContentMarkers.finishReason, "tool_calls");
   assert.equal(stillUsesContentMarkers.message.tool_calls[0].function.name, "write");
+
+  const finalResultWithLeadingJunk = buildBridgeResultFromText("]\nHello", "");
+  assert.equal(finalResultWithLeadingJunk.kind, "final");
+  assert.equal(finalResultWithLeadingJunk.message.content, "Hello");
 
   const sse = buildSSEFromBridge(transcript);
   assert.match(sse, /"finish_reason":"tool_calls"/);

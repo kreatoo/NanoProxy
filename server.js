@@ -516,7 +516,8 @@ function encodeToolResultBlock(message) {
     "Do not narrate the next step in plain text.",
     "Do not say what you are about to do.",
     "Do not use legacy forms like [question], [write], [read], or raw tool_calls JSON unless recovery is needed.",
-    "If more than one independent tool call is needed, include multiple CALL blocks. Otherwise call the next tool immediately or give the final answer envelope."
+    "If more than one independent tool call is needed, include multiple CALL blocks. Otherwise call the next tool immediately or give the final answer envelope.",
+    "If a required detail is genuinely missing or the user must choose between materially different options, prefer the question tool instead of guessing."
   ].join("\n");
 }
 
@@ -530,6 +531,7 @@ function encodeUserMessageForBridge(content, options = {}) {
     `- Start with ${TOOL_MODE_MARKER} or ${FINAL_MODE_MARKER}.`,
     `- If you need to inspect, search, read, edit, write, or plan work, reply with ${TOOL_MODE_MARKER}.`,
     `- Inside ${TOOL_MODE_MARKER}, only use ${CALL_MODE_MARKER} JSON ${CALL_MODE_END_MARKER}.`,
+    "- If you genuinely need clarification before acting, prefer the question tool instead of guessing.",
     "- Do not use [question], [write], [read], or any other bracketed legacy tool format.",
     "- Do not narrate what you are about to do in plain text.",
     firstTurn
@@ -566,6 +568,7 @@ function buildBridgeSystemMessage(tools) {
     "- Emit one or more tool calls only when they are independent and can be executed in parallel or as a batch.",
     "- If several reads/searches are needed immediately, include multiple CALL blocks in the same tool envelope.",
     "- If sequencing matters, emit only the next required tool call.",
+    "- If important clarification is missing, use the question tool instead of inventing requirements.",
     "- After each tool result, decide the next tool call or CALL batch.",
     "- On the first assistant turn for a coding task, usually call a search/read/list tool first.",
     "- Use tool names exactly as listed.",
@@ -1221,7 +1224,7 @@ function parseBridgeAssistantText(text) {
       if (toolCalls.length > 0) return { kind: "tool_calls", toolCalls };
     }
     if (typeof fencedJson.content === "string") {
-      return { kind: "final", content: fencedJson.content };
+      return { kind: "final", content: stripLeadingMarkerJunk(fencedJson.content) };
     }
   }
 
@@ -1238,7 +1241,7 @@ function parseBridgeAssistantText(text) {
     }
 
     if (typeof embedded.content === "string") {
-      return { kind: "final", content: embedded.content };
+      return { kind: "final", content: stripLeadingMarkerJunk(embedded.content) };
     }
   }
 
@@ -1309,7 +1312,7 @@ function buildBridgeResultFromText(text, reasoning) {
     kind: "final",
     message: {
       role: "assistant",
-      content: parsed.kind === "final" ? parsed.content : (parsed.content || text || ""),
+      content: stripLeadingMarkerJunk(parsed.kind === "final" ? parsed.content : (parsed.content || text || "")),
       reasoning_content: reasoning || ""
     },
     finishReason: "stop"
@@ -1369,7 +1372,7 @@ function extractStreamableFinalContent(content) {
     ? stripMarker(source, FINAL_MODE_MARKER)
     : source;
   const endIndex = withoutStart.indexOf(FINAL_MODE_END_MARKER);
-  return endIndex === -1 ? withoutStart : withoutStart.slice(0, endIndex);
+  return stripLeadingMarkerJunk(endIndex === -1 ? withoutStart : withoutStart.slice(0, endIndex));
 }
 
 function buildSSEFromBridge(aggregate) {
