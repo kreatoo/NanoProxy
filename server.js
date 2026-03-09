@@ -29,10 +29,10 @@ const TOOL_MODE_MARKER_ALIASES = ["[OPENCODE_TOOL]", TOOL_MODE_MARKER];
 const FINAL_MODE_MARKER_ALIASES = ["[OPENCODE_FINAL]", FINAL_MODE_MARKER];
 const TOOL_MODE_END_MARKER_ALIASES = ["[/OPENCODE_TOOL]", TOOL_MODE_END_MARKER];
 const FINAL_MODE_END_MARKER_ALIASES = ["[/OPENCODE_FINAL]", FINAL_MODE_END_MARKER];
-const LOOSE_TOOL_START_REGEX = /\[{1,2}\s*OPENCODE_TOOLS?\s*\]{1,2}/i;
-const LOOSE_TOOL_END_REGEX = /\[{1,2}\s*\/\s*OPENCODE_TOOLS?\s*\]{1,2}/i;
-const LOOSE_FINAL_START_REGEX = /\[{1,2}\s*OPENCODE_FINAL\s*\]{1,2}/i;
-const LOOSE_FINAL_END_REGEX = /\[{1,2}\s*\/\s*OPENCODE_FINAL\s*\]{1,2}/i;
+const LOOSE_TOOL_START_REGEX = /\[?\[{1,2}\s*OPENCODE_TOOLS?\s*\]{1,2}/i;
+const LOOSE_TOOL_END_REGEX = /\[?\[{1,2}\s*\/\s*OPENCODE_TOOLS?\s*\]{1,2}/i;
+const LOOSE_FINAL_START_REGEX = /\[?\[{1,2}\s*OPENCODE_FINAL\s*\]{1,2}/i;
+const LOOSE_FINAL_END_REGEX = /\[?\[{1,2}\s*\/\s*OPENCODE_FINAL\s*\]{1,2}/i;
 const LOOSE_CALL_START_REGEX = /\[{1,2}\s*CALL\s*\]{1,2}/i;
 const LOOSE_CALL_END_REGEX = /\[{1,2}\s*\/\s*CALL\s*\]{1,2}/i;
 
@@ -819,11 +819,26 @@ function stripCodeFenceMarkers(text) {
 function normalizeEmbeddedPayloadShape(value) {
   if (!value) return null;
 
+  const legacyArgsFromValue = (item) => {
+    const args = {};
+    if (item && item.params && typeof item.params === "object" && !Array.isArray(item.params)) {
+      Object.assign(args, item.params);
+    }
+    if (item && item.arguments && typeof item.arguments === "object" && !Array.isArray(item.arguments)) {
+      Object.assign(args, item.arguments);
+    }
+    if (item && typeof item.purpose === "string" && args.purpose === undefined) {
+      args.purpose = item.purpose;
+    }
+    return args;
+  };
+
   if (Array.isArray(value)) {
     const toolCalls = value
       .filter((item) => item && typeof item === "object")
       .map((item) => {
         if (typeof item.name === "string") return { name: item.name, arguments: item.arguments || {} };
+        if (typeof item.tool === "string") return { name: item.tool, arguments: legacyArgsFromValue(item) };
         if (item.function && typeof item.function.name === "string") {
           return { name: item.function.name, arguments: item.function.arguments || {} };
         }
@@ -840,6 +855,12 @@ function normalizeEmbeddedPayloadShape(value) {
     return { tool_calls: [value.tool_calls] };
   }
   if (typeof value.name === "string") return value;
+  if (typeof value.tool === "string") {
+    return {
+      name: value.tool,
+      arguments: legacyArgsFromValue(value)
+    };
+  }
   if (value.function && typeof value.function.name === "string") {
     return {
       name: value.function.name,
@@ -954,6 +975,17 @@ function stripLeadingMarkerJunk(text) {
   return String(text || "").replace(/^\s*[\]\}\),;:]+\s*/, "");
 }
 
+function normalizeBridgeMarkers(text) {
+  let source = String(text || "");
+  source = source.replace(/\[?\[?\s*OPENCODE_TOOLS?\s*\]?\]?/gi, TOOL_MODE_MARKER);
+  source = source.replace(/\[?\[?\s*\/\s*OPENCODE_TOOLS?\s*\]?\]?/gi, TOOL_MODE_END_MARKER);
+  source = source.replace(/\[?\[?\s*OPENCODE_FINAL\s*\]?\]?/gi, FINAL_MODE_MARKER);
+  source = source.replace(/\[?\[?\s*\/\s*OPENCODE_FINAL\s*\]?\]?/gi, FINAL_MODE_END_MARKER);
+  source = source.replace(/\[?\[?\s*CALL\s*\]?\]?/gi, CALL_MODE_MARKER);
+  source = source.replace(/\[?\[?\s*\/\s*CALL\s*\]?\]?/gi, CALL_MODE_END_MARKER);
+  return source;
+}
+
 function extractAnyMarkerEnvelope(text, startMarkers, endMarkers) {
   const source = String(text || "");
   for (const startMarker of startMarkers) {
@@ -1020,7 +1052,7 @@ function findMarkerEnd(text, markers, looseRegex) {
 }
 
 function extractPartialToolEnvelope(text) {
-  const source = String(text || "");
+  const source = normalizeBridgeMarkers(text);
   const start = findMarkerStart(source, TOOL_MODE_MARKER_ALIASES, LOOSE_TOOL_START_REGEX);
   if (!start) return null;
   const afterStart = source.slice(start.index + start.length);
@@ -1151,7 +1183,8 @@ function extractProgressiveToolCalls(text) {
 }
 
 function parseBridgeAssistantText(text) {
-  const canonicalTool = extractAnyMarkerEnvelope(text, TOOL_MODE_MARKER_ALIASES, TOOL_MODE_END_MARKER_ALIASES);
+  const normalizedText = normalizeBridgeMarkers(text);
+  const canonicalTool = extractAnyMarkerEnvelope(normalizedText, TOOL_MODE_MARKER_ALIASES, TOOL_MODE_END_MARKER_ALIASES);
   if (canonicalTool !== null) {
     const callEnvelopes = extractCallEnvelopes(canonicalTool);
     if (callEnvelopes.length > 0) {
@@ -1164,10 +1197,10 @@ function parseBridgeAssistantText(text) {
     }
     const toolCalls = bestEffortParseToolPayload(canonicalTool);
     if (toolCalls && toolCalls.length > 0) return { kind: "tool_calls", toolCalls };
-    return { kind: "invalid_tool_block", raw: text };
+    return { kind: "invalid_tool_block", raw: normalizedText };
   }
 
-  const looseTool = extractLooseMarkerEnvelope(text, LOOSE_TOOL_START_REGEX, LOOSE_TOOL_END_REGEX);
+  const looseTool = extractLooseMarkerEnvelope(normalizedText, LOOSE_TOOL_START_REGEX, LOOSE_TOOL_END_REGEX);
   if (looseTool !== null) {
     const callEnvelopes = extractCallEnvelopes(looseTool);
     if (callEnvelopes.length > 0) {
@@ -1180,34 +1213,34 @@ function parseBridgeAssistantText(text) {
     }
     const toolCalls = bestEffortParseToolPayload(looseTool);
     if (toolCalls && toolCalls.length > 0) return { kind: "tool_calls", toolCalls };
-    return { kind: "invalid_tool_block", raw: text };
+    return { kind: "invalid_tool_block", raw: normalizedText };
   }
 
-  const canonicalFinal = extractAnyMarkerEnvelope(text, FINAL_MODE_MARKER_ALIASES, FINAL_MODE_END_MARKER_ALIASES);
+  const canonicalFinal = extractAnyMarkerEnvelope(normalizedText, FINAL_MODE_MARKER_ALIASES, FINAL_MODE_END_MARKER_ALIASES);
   if (canonicalFinal !== null) {
     return { kind: "final", content: stripLeadingMarkerJunk(canonicalFinal) };
   }
 
-  const looseFinal = extractLooseMarkerEnvelope(text, LOOSE_FINAL_START_REGEX, LOOSE_FINAL_END_REGEX);
+  const looseFinal = extractLooseMarkerEnvelope(normalizedText, LOOSE_FINAL_START_REGEX, LOOSE_FINAL_END_REGEX);
   if (looseFinal !== null) {
     return { kind: "final", content: stripLeadingMarkerJunk(looseFinal) };
   }
 
-  if (startsWithAnyMarker(text, TOOL_MODE_MARKER_ALIASES)) {
-    return parseBridgeAssistantText(stripAnyMarker(text, TOOL_MODE_MARKER_ALIASES));
+  if (startsWithAnyMarker(normalizedText, TOOL_MODE_MARKER_ALIASES)) {
+    return parseBridgeAssistantText(stripAnyMarker(normalizedText, TOOL_MODE_MARKER_ALIASES));
   }
 
-  if (startsWithAnyMarker(text, FINAL_MODE_MARKER_ALIASES)) {
-    return { kind: "final", content: stripLeadingMarkerJunk(stripAnyMarker(text, FINAL_MODE_MARKER_ALIASES)) };
+  if (startsWithAnyMarker(normalizedText, FINAL_MODE_MARKER_ALIASES)) {
+    return { kind: "final", content: stripLeadingMarkerJunk(stripAnyMarker(normalizedText, FINAL_MODE_MARKER_ALIASES)) };
   }
 
-  const toolBlock = extractFencedBlock(text, TOOL_BLOCK_LABEL);
+  const toolBlock = extractFencedBlock(normalizedText, TOOL_BLOCK_LABEL);
   if (toolBlock) {
     const toolCalls = bestEffortParseToolPayload(toolBlock);
     if (toolCalls && toolCalls.length > 0) return { kind: "tool_calls", toolCalls };
   }
 
-  const finalBlock = extractFencedBlock(text, FINAL_BLOCK_LABEL);
+  const finalBlock = extractFencedBlock(normalizedText, FINAL_BLOCK_LABEL);
   if (finalBlock) {
     const parsed = tryParseJsonLenient(finalBlock);
     if (parsed.ok && parsed.value && typeof parsed.value === "object" && typeof parsed.value.content === "string") {
@@ -1216,7 +1249,7 @@ function parseBridgeAssistantText(text) {
     return { kind: "final", content: stripLeadingMarkerJunk(finalBlock) };
   }
 
-  const fencedJson = parseAnyFencedJsonPayload(text);
+  const fencedJson = parseAnyFencedJsonPayload(normalizedText);
   if (fencedJson) {
     if (Array.isArray(fencedJson.tool_calls) || typeof fencedJson.name === "string") {
       const rawCalls = Array.isArray(fencedJson.tool_calls) ? fencedJson.tool_calls : [fencedJson];
@@ -1228,7 +1261,7 @@ function parseBridgeAssistantText(text) {
     }
   }
 
-  const embedded = parseEmbeddedJsonPayload(text);
+  const embedded = parseEmbeddedJsonPayload(normalizedText);
   if (embedded) {
     if (Array.isArray(embedded.tool_calls) || typeof embedded.name === "string") {
       const rawCalls = Array.isArray(embedded.tool_calls)
@@ -1245,13 +1278,13 @@ function parseBridgeAssistantText(text) {
     }
   }
 
-  const bracketNamedTool = extractBracketNamedToolBlock(text);
+  const bracketNamedTool = extractBracketNamedToolBlock(normalizedText);
   if (bracketNamedTool) {
     const toolCalls = normalizeParsedToolCalls([bracketNamedTool]);
     if (toolCalls.length > 0) return { kind: "tool_calls", toolCalls };
   }
 
-  return { kind: "plain", content: text || "" };
+  return { kind: "plain", content: normalizedText || "" };
 }
 
 function parseSSETranscript(text) {

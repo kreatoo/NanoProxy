@@ -238,6 +238,12 @@ function run() {
   assert.equal(parsedLoosePluralToolMarker.toolCalls[0].function.name, "write");
   assert.match(parsedLoosePluralToolMarker.toolCalls[0].function.arguments, /b.txt/);
 
+  const parsedBrokenToolMarker = parseBridgeAssistantText(
+    "OPENCODE_TOOL]\n[CALL]\n{\"name\":\"write\",\"arguments\":{\"filePath\":\"c.txt\",\"content\":\"z\"}}\n[/CALL]\n[/OPENCODE_TOOL]"
+  );
+  assert.equal(parsedBrokenToolMarker.kind, "tool_calls");
+  assert.equal(parsedBrokenToolMarker.toolCalls[0].function.name, "write");
+
   const parsedFinalMarker = parseBridgeAssistantText(
     "[[OPENCODE_FINAL]]\nDone.\n[[/OPENCODE_FINAL]]"
   );
@@ -274,6 +280,13 @@ function run() {
   );
   assert.equal(parsedBracketNamedToolWithLeadingJunk.kind, "tool_calls");
   assert.equal(parsedBracketNamedToolWithLeadingJunk.toolCalls[0].function.name, "question");
+
+  const parsedLegacyCallWithParams = parseBridgeAssistantText(
+    "[OPENCODE_TOOL]\n[CALL]\n{\"tool\":\"explorer\",\"params\":{\"pattern\":\"**/*.{ts,tsx}\"},\"purpose\":\"Find TS files\"}\n[/CALL]\n[/OPENCODE_TOOL]"
+  );
+  assert.equal(parsedLegacyCallWithParams.kind, "tool_calls");
+  assert.equal(parsedLegacyCallWithParams.toolCalls[0].function.name, "explorer");
+  assert.match(parsedLegacyCallWithParams.toolCalls[0].function.arguments, /Find TS files/);
 
   const parsedCanonicalEnvelopeInsideProse = parseBridgeAssistantText(
     "I will do it now.\n[[OPENCODE_TOOL]]\n{\"tool_calls\":[{\"name\":\"read\",\"arguments\":{\"filePath\":\"c.txt\"}}]}\n[[/OPENCODE_TOOL]]\nThanks."
