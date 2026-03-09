@@ -84,7 +84,12 @@ function run() {
   assert.match(kimiRequest.rewritten.messages[0].content, /tool_input/);
   assert.match(kimiRequest.rewritten.messages[1].content, /tool_name/);
   assert.match(kimiRequest.rewritten.messages[1].content, /tool_input/);
+  assert.match(kimiRequest.rewritten.messages[0].content, /Emit exactly one CALL block per tool reply/);
+  assert.match(kimiRequest.rewritten.messages[0].content, /Do not batch multiple tool calls in one reply/);
+  assert.match(kimiRequest.rewritten.messages[0].content, /Do not emit \[\[CALL\]\] without first emitting \[\[OPENCODE_TOOL\]\]/);
   assert.doesNotMatch(kimiRequest.rewritten.messages[0].content, /Each CALL JSON object must use name and arguments/);
+  assert.doesNotMatch(kimiRequest.rewritten.messages[0].content, /Valid multi-tool example/);
+  assert.match(kimiRequest.rewritten.messages[1].content, /Do not output a second \[\[CALL\]\] until the first tool result comes back/);
 
   const requestWithToolResult = transformRequestForBridge({
     model: "zai-org/glm-5:thinking",
@@ -114,6 +119,29 @@ function run() {
   assert.match(bridgedToolResultMessage.content, /oldString must include enough unique surrounding context/);
   const bridgedUserMessage = requestWithToolResult.rewritten.messages.find((msg) => msg.role === "user" && /Protocol requirements for your next reply/.test(msg.content || ""));
   assert.ok(bridgedUserMessage);
+
+  const kimiToolResultRequest = transformRequestForBridge({
+    model: "moonshotai/kimi-k2.5:thinking",
+    tools: [
+      {
+        name: "write",
+        description: "Write a file",
+        parameters: { type: "object", properties: { filePath: { type: "string" } } }
+      }
+    ],
+    messages: [
+      { role: "user", content: "do it" },
+      {
+        role: "tool",
+        tool_call_id: "call_kimi",
+        content: "Wrote file successfully."
+      }
+    ]
+  });
+  const kimiBridgedToolResultMessage = kimiToolResultRequest.rewritten.messages.find((msg) => msg.role === "user" && /opencode-tool-result/.test(msg.content || ""));
+  assert.ok(kimiBridgedToolResultMessage);
+  assert.match(kimiBridgedToolResultMessage.content, /Do not batch multiple tool calls in one reply/);
+  assert.match(kimiBridgedToolResultMessage.content, /Always include the outer \[\[OPENCODE_TOOL\]\] \.\.\. \[\[\/OPENCODE_TOOL\]\] wrapper/);
 
   const requestWithTypedToolResult = transformRequestForBridge({
     model: "zai-org/glm-5:thinking",
@@ -447,6 +475,25 @@ function run() {
   );
   assert.equal(progressiveClosedCallMarkers.length, 2);
   assert.equal(progressiveClosedCallMarkers[1].function.name, "read");
+
+  const progressiveCallOnlyMarkers = extractProgressiveToolCalls(
+    '[[CALL]]\n{"tool_name":"read","tool_input":{"filePath":"a.txt"}}\n[[/CALL]]\n[[CALL]]\n{"tool_name":"read","tool_input":{"filePath":"b.txt"}}'
+  );
+  assert.equal(progressiveCallOnlyMarkers.length, 1);
+  assert.equal(progressiveCallOnlyMarkers[0].function.name, "read");
+
+  const progressiveMalformedCallCloser = extractProgressiveToolCalls(
+    '[[CALL]]\n{"tool_name":"read","tool_input":{"filePath":"a.txt"}}\n/CALL]]'
+  );
+  assert.equal(progressiveMalformedCallCloser.length, 1);
+  assert.equal(progressiveMalformedCallCloser[0].function.name, "read");
+
+  const parsedCallOnlyMarkers = parseBridgeAssistantText(
+    '[[CALL]]\n{"tool_name":"read","tool_input":{"filePath":"a.txt"}}\n[[/CALL]]\n[[CALL]]\n{"tool_name":"read","tool_input":{"filePath":"b.txt"}}\n[[/CALL]]'
+  );
+  assert.equal(parsedCallOnlyMarkers.kind, "tool_calls");
+  assert.equal(parsedCallOnlyMarkers.toolCalls.length, 2);
+  assert.equal(parsedCallOnlyMarkers.toolCalls[1].function.name, "read");
 
   const ignoresReasoningMarkers = buildBridgeResultFromText(
     "Normal final text.",

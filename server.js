@@ -44,6 +44,10 @@ function getBridgeFlavor(modelId) {
   return "default";
 }
 
+function isSingleCallFlavor(flavor) {
+  return flavor === "kimi";
+}
+
 function buildUpstreamUrl(requestPath) {
   const base = UPSTREAM_BASE_URL.replace(/\/+$/, "");
   const suffix = String(requestPath || "").replace(/^\/+/, "");
@@ -298,37 +302,36 @@ function salvageMalformedToolCalls(text) {
 function bestEffortParseToolPayload(text) {
   const source = String(text || "").trim();
   const wrappedSource = /^[{\[]/.test(source) ? source : `{${source}}`;
+  const extractToolCallsFromParsedValue = (value) => {
+    if (!value || typeof value !== "object") return null;
+    const normalized = normalizeEmbeddedPayloadShape(value);
+    if (!normalized) return null;
+    const rawCalls = Array.isArray(normalized.tool_calls)
+      ? normalized.tool_calls
+      : (normalized.tool_calls && typeof normalized.tool_calls === "object" ? [normalized.tool_calls] : [])
+        .concat(normalized.name ? [normalized] : []);
+    const toolCalls = normalizeParsedToolCalls(rawCalls);
+    return toolCalls.length > 0 ? toolCalls : null;
+  };
 
   const parsed = tryParseJsonLenient(source);
   if (parsed.ok && parsed.value && typeof parsed.value === "object") {
-    const rawCalls = Array.isArray(parsed.value.tool_calls)
-      ? parsed.value.tool_calls
-      : (parsed.value.tool_calls && typeof parsed.value.tool_calls === "object" ? [parsed.value.tool_calls] : [])
-        .concat(parsed.value.name ? [parsed.value] : []);
-    const toolCalls = normalizeParsedToolCalls(rawCalls);
-    if (toolCalls.length > 0) return toolCalls;
+    const toolCalls = extractToolCallsFromParsedValue(parsed.value);
+    if (toolCalls) return toolCalls;
   }
 
   if (wrappedSource !== source) {
     const wrappedParsed = tryParseJsonLenient(wrappedSource);
     if (wrappedParsed.ok && wrappedParsed.value && typeof wrappedParsed.value === "object") {
-      const rawCalls = Array.isArray(wrappedParsed.value.tool_calls)
-        ? wrappedParsed.value.tool_calls
-        : (wrappedParsed.value.tool_calls && typeof wrappedParsed.value.tool_calls === "object" ? [wrappedParsed.value.tool_calls] : [])
-          .concat(wrappedParsed.value.name ? [wrappedParsed.value] : []);
-      const toolCalls = normalizeParsedToolCalls(rawCalls);
-      if (toolCalls.length > 0) return toolCalls;
+      const toolCalls = extractToolCallsFromParsedValue(wrappedParsed.value);
+      if (toolCalls) return toolCalls;
     }
   }
 
   const parsedClosed = tryParseJsonLenient(closeUnbalancedJson(source));
   if (parsedClosed.ok && parsedClosed.value && typeof parsedClosed.value === "object") {
-    const rawCalls = Array.isArray(parsedClosed.value.tool_calls)
-      ? parsedClosed.value.tool_calls
-      : (parsedClosed.value.tool_calls && typeof parsedClosed.value.tool_calls === "object" ? [parsedClosed.value.tool_calls] : [])
-        .concat(parsedClosed.value.name ? [parsedClosed.value] : []);
-    const toolCalls = normalizeParsedToolCalls(rawCalls);
-    if (toolCalls.length > 0) return toolCalls;
+    const toolCalls = extractToolCallsFromParsedValue(parsedClosed.value);
+    if (toolCalls) return toolCalls;
   }
   const normalized = parseEmbeddedJsonPayload(text);
   if (normalized && (Array.isArray(normalized.tool_calls) || typeof normalized.name === "string")) {
@@ -512,6 +515,9 @@ function encodeToolResultBlock(message, flavor = "default") {
   const callPayloadExample = flavor === "kimi"
     ? `{"tool_name":"read","tool_input":{"filePath":"src/app.js"}}`
     : `{"name":"read","arguments":{"filePath":"src/app.js"}}`;
+  const nextStepRule = isSingleCallFlavor(flavor)
+    ? "Reply with exactly one CALL block inside one tool envelope, or one final envelope. Do not batch multiple tool calls in one reply."
+    : "If more than one independent tool call is needed, include multiple CALL blocks. Otherwise call the next tool immediately or give the final answer envelope.";
   const payload = {
     tool_call_id: message.tool_call_id || "",
     content: contentPartsToText(message.content)
@@ -527,14 +533,17 @@ function encodeToolResultBlock(message, flavor = "default") {
     `Your next reply must use exactly one of these formats: ${TOOL_MODE_MARKER} ... ${TOOL_MODE_END_MARKER} or ${FINAL_MODE_MARKER} ... ${FINAL_MODE_END_MARKER}.`,
     `For tool use, only use ${CALL_MODE_MARKER} ... ${CALL_MODE_END_MARKER} blocks inside ${TOOL_MODE_MARKER}.`,
     `Inside each CALL block, use exactly this JSON shape: ${callPayloadExample}`,
+    isSingleCallFlavor(flavor)
+      ? `Always include the outer ${TOOL_MODE_MARKER} ... ${TOOL_MODE_END_MARKER} wrapper.`
+      : null,
     "Do not narrate the next step in plain text.",
     "Do not say what you are about to do.",
     "For edit calls, oldString must include enough unique surrounding context to match exactly one location.",
     "If an edit could match multiple places, read more context first and then send a larger oldString.",
     "Do not use legacy forms like [question], [write], [read], or raw tool_calls JSON unless recovery is needed.",
-    "If more than one independent tool call is needed, include multiple CALL blocks. Otherwise call the next tool immediately or give the final answer envelope.",
+    nextStepRule,
     "If a required detail is genuinely missing or the user must choose between materially different options, prefer the question tool instead of guessing."
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 function encodeUserMessageForBridge(content, options = {}) {
@@ -544,14 +553,22 @@ function encodeUserMessageForBridge(content, options = {}) {
   const callPayloadExample = flavor === "kimi"
     ? `{"tool_name":"read","tool_input":{"filePath":"src/app.js"}}`
     : `{"name":"read","arguments":{"filePath":"src/app.js"}}`;
+  const callCountRule = isSingleCallFlavor(flavor)
+    ? `- Use exactly one ${CALL_MODE_MARKER} block per reply.`
+    : `- If several independent operations are immediately needed, you may include multiple ${CALL_MODE_MARKER} blocks in the same tool envelope.`;
   return [
     text,
     "",
     "Protocol requirements for your next reply:",
     `- Start with ${TOOL_MODE_MARKER} or ${FINAL_MODE_MARKER}.`,
     `- If you need to inspect, search, read, edit, write, or plan work, reply with ${TOOL_MODE_MARKER}.`,
+    `- Always include the outer ${TOOL_MODE_MARKER} ... ${TOOL_MODE_END_MARKER} wrapper for tool use.`,
     `- Inside ${TOOL_MODE_MARKER}, only use ${CALL_MODE_MARKER} JSON ${CALL_MODE_END_MARKER}.`,
     `- Inside each CALL block, use exactly this JSON shape: ${callPayloadExample}`,
+    callCountRule,
+    isSingleCallFlavor(flavor)
+      ? `- Do not output a second ${CALL_MODE_MARKER} until the first tool result comes back.`
+      : null,
     "- For edit, use an oldString with enough unique surrounding context to match exactly one place.",
     "- If an edit target is ambiguous, read more context first instead of guessing a short oldString.",
     "- If you genuinely need clarification before acting, prefer the question tool instead of guessing.",
@@ -560,7 +577,7 @@ function encodeUserMessageForBridge(content, options = {}) {
     firstTurn
       ? "- On the first assistant turn, if the user already gave a concrete task, prefer acting on it directly rather than replying with a generic greeting or conversation opener."
       : "- Continue with the next concrete action, not a narration step."
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 function buildBridgeSystemMessage(tools, flavor = "default") {
@@ -574,6 +591,12 @@ function buildBridgeSystemMessage(tools, flavor = "default") {
   const validReadExample2 = flavor === "kimi"
     ? { tool_name: "read", tool_input: { filePath: "src/styles.css" } }
     : { name: "read", arguments: { filePath: "src/styles.css" } };
+  const callCountRule = isSingleCallFlavor(flavor)
+    ? "- Emit exactly one CALL block per tool reply."
+    : "- Emit one or more tool calls only when they are independent and can be executed in parallel or as a batch.";
+  const batchRule = isSingleCallFlavor(flavor)
+    ? "- Do not batch multiple tool calls in one reply. After the tool result returns, send the next tool call."
+    : "- If several reads/searches are needed immediately, include multiple CALL blocks in the same tool envelope.";
   return [
     "Tool bridge mode is enabled.",
     "The upstream provider's native tool calling is disabled for this request.",
@@ -589,7 +612,9 @@ function buildBridgeSystemMessage(tools, flavor = "default") {
     JSON.stringify(callExample, null, 2),
     CALL_MODE_END_MARKER,
     TOOL_MODE_END_MARKER,
-    "Inside the tool envelope, emit one or more CALL blocks. Each CALL block contains one tool call as JSON.",
+    isSingleCallFlavor(flavor)
+      ? "Inside the tool envelope, emit exactly one CALL block. Each CALL block contains one tool call as JSON."
+      : "Inside the tool envelope, emit one or more CALL blocks. Each CALL block contains one tool call as JSON.",
     "Rules for tool use:",
     `- Output ${TOOL_MODE_MARKER} first and ${TOOL_MODE_END_MARKER} last.`,
     `- For each tool call, wrap it in ${CALL_MODE_MARKER} and ${CALL_MODE_END_MARKER}.`,
@@ -600,13 +625,18 @@ function buildBridgeSystemMessage(tools, flavor = "default") {
     flavor === "kimi"
       ? "- For Kimi, each CALL JSON object must use tool_name and tool_input. Do not use name/arguments."
       : "- Each CALL JSON object must use name and arguments. Do not use tool_name/tool_input.",
-    "- Emit one or more tool calls only when they are independent and can be executed in parallel or as a batch.",
-    "- If several reads/searches are needed immediately, include multiple CALL blocks in the same tool envelope.",
+    callCountRule,
+    batchRule,
+    isSingleCallFlavor(flavor)
+      ? `- Do not emit ${CALL_MODE_MARKER} without first emitting ${TOOL_MODE_MARKER}.`
+      : null,
     "- If sequencing matters, emit only the next required tool call.",
     "- For edit, oldString must be unique in the target file. Include enough surrounding context to identify one location.",
     "- If edit would likely match multiple locations, read more of the file first and then retry with a larger oldString.",
     "- If important clarification is missing, use the question tool instead of inventing requirements.",
-    "- After each tool result, decide the next tool call or CALL batch.",
+    isSingleCallFlavor(flavor)
+      ? "- After each tool result, decide the next single tool call or final answer."
+      : "- After each tool result, decide the next tool call or CALL batch.",
     "- On the first assistant turn for a coding task, usually call a search/read/list tool first.",
     "- Use tool names exactly as listed.",
     "- arguments must be a valid JSON object.",
@@ -622,15 +652,17 @@ function buildBridgeSystemMessage(tools, flavor = "default") {
     JSON.stringify(validReadExample, null, 2),
     CALL_MODE_END_MARKER,
     TOOL_MODE_END_MARKER,
-    "Valid multi-tool example:",
-    TOOL_MODE_MARKER,
-    CALL_MODE_MARKER,
-    JSON.stringify(validReadExample, null, 2),
-    CALL_MODE_END_MARKER,
-    CALL_MODE_MARKER,
-    JSON.stringify(validReadExample2, null, 2),
-    CALL_MODE_END_MARKER,
-    TOOL_MODE_END_MARKER,
+    ...(!isSingleCallFlavor(flavor) ? [
+      "Valid multi-tool example:",
+      TOOL_MODE_MARKER,
+      CALL_MODE_MARKER,
+      JSON.stringify(validReadExample, null, 2),
+      CALL_MODE_END_MARKER,
+      CALL_MODE_MARKER,
+      JSON.stringify(validReadExample2, null, 2),
+      CALL_MODE_END_MARKER,
+      TOOL_MODE_END_MARKER
+    ] : []),
     `If you are giving a final answer to the user and no tool is needed, use this exact envelope:`,
     FINAL_MODE_MARKER,
     "Your final answer text goes here.",
@@ -642,7 +674,7 @@ function buildBridgeSystemMessage(tools, flavor = "default") {
     "- Do not mix normal prose before either marker.",
     "Available tools:",
     JSON.stringify(catalog, null, 2)
-  ].join("\n\n");
+  ].filter(Boolean).join("\n\n");
 }
 
 function translateMessagesForBridge(messages, tools, modelId) {
@@ -1121,6 +1153,9 @@ function normalizeBridgeMarkers(text) {
   source = source.replace(/\[\s*\/+\s*\[\s*OPENCODE_TOOLS?\s*\]?\]?/gi, TOOL_MODE_END_MARKER);
   source = source.replace(/\[\s*\/+\s*\[\s*OPENCODE_FINAL\s*\]?\]?/gi, FINAL_MODE_END_MARKER);
   source = source.replace(/\[\s*\/+\s*\[\s*CALL\s*\]?\]?/gi, CALL_MODE_END_MARKER);
+  source = source.replace(/(^|[\r\n])\s*\/\s*OPENCODE_TOOLS?\s*\]?\]?/gi, `$1${TOOL_MODE_END_MARKER}`);
+  source = source.replace(/(^|[\r\n])\s*\/\s*OPENCODE_FINAL\s*\]?\]?/gi, `$1${FINAL_MODE_END_MARKER}`);
+  source = source.replace(/(^|[\r\n])\s*\/\s*CALL\s*\]?\]?/gi, `$1${CALL_MODE_END_MARKER}`);
   source = source.replace(/\[?\[?\s*OPENCODE_TOOLS?\s*\]?\]?/gi, TOOL_MODE_MARKER);
   source = source.replace(/\[?\[?\s*\/\s*OPENCODE_TOOLS?\s*\]?\]?/gi, TOOL_MODE_END_MARKER);
   source = source.replace(/\[?\[?\s*OPENCODE_FINAL\s*\]?\]?/gi, FINAL_MODE_MARKER);
@@ -1202,6 +1237,15 @@ function extractPartialToolEnvelope(text) {
   const afterStart = source.slice(start.index + start.length);
   const end = findMarkerEnd(afterStart, TOOL_MODE_END_MARKER_ALIASES, LOOSE_TOOL_END_REGEX);
   return end ? afterStart.slice(0, end.index).trim() : afterStart.trim();
+}
+
+function extractProgressiveToolSource(text) {
+  const normalized = normalizeBridgeMarkers(text);
+  const payload = extractPartialToolEnvelope(normalized);
+  if (payload !== null) return payload;
+  const callStart = findMarkerStart(normalized, CALL_MODE_MARKER_ALIASES, LOOSE_CALL_START_REGEX);
+  if (callStart) return normalized.slice(callStart.index).trim();
+  return null;
 }
 
 function extractCallEnvelopes(text, allowPartial = false) {
@@ -1304,7 +1348,7 @@ function extractBracketNamedToolBlock(text) {
 }
 
 function extractProgressiveToolCalls(text) {
-  const payload = extractPartialToolEnvelope(text);
+  const payload = extractProgressiveToolSource(text);
   if (!payload) return [];
 
   const callEnvelopes = extractCallEnvelopes(payload, false);
@@ -1358,6 +1402,16 @@ function parseBridgeAssistantText(text) {
     const toolCalls = bestEffortParseToolPayload(looseTool);
     if (toolCalls && toolCalls.length > 0) return { kind: "tool_calls", toolCalls };
     return { kind: "invalid_tool_block", raw: normalizedText };
+  }
+
+  const callOnlyEnvelopes = extractCallEnvelopes(normalizedText);
+  if (callOnlyEnvelopes.length > 0) {
+    const recovered = [];
+    for (const envelope of callOnlyEnvelopes) {
+      const toolCalls = bestEffortParseToolPayload(envelope);
+      if (toolCalls && toolCalls.length > 0) recovered.push(...toolCalls);
+    }
+    if (recovered.length > 0) return { kind: "tool_calls", toolCalls: recovered };
   }
 
   const canonicalFinal = extractAnyMarkerEnvelope(normalizedText, FINAL_MODE_MARKER_ALIASES, FINAL_MODE_END_MARKER_ALIASES);
