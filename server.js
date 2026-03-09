@@ -36,6 +36,14 @@ const LOOSE_FINAL_END_REGEX = /\[?\[{1,2}\s*\/\s*OPENCODE_FINAL\s*\]{1,2}/i;
 const LOOSE_CALL_START_REGEX = /\[{1,2}\s*CALL\s*\]{1,2}/i;
 const LOOSE_CALL_END_REGEX = /\[{1,2}\s*\/\s*CALL\s*\]{1,2}/i;
 
+function getBridgeFlavor(modelId) {
+  const lower = String(modelId || "").toLowerCase();
+  if (lower.includes("moonshotai/kimi") || lower.includes("kimi-k2.5") || lower.includes("kimi")) {
+    return "kimi";
+  }
+  return "default";
+}
+
 function buildUpstreamUrl(requestPath) {
   const base = UPSTREAM_BASE_URL.replace(/\/+$/, "");
   const suffix = String(requestPath || "").replace(/^\/+/, "");
@@ -248,43 +256,6 @@ function salvageTodowriteArguments(argumentsText) {
   return todos.length > 0 ? { todos } : null;
 }
 
-function extractJsonLikeStringField(text, fieldName) {
-  const source = String(text || "");
-  const fieldRegex = new RegExp(`"${fieldName}"\\s*:\\s*"`, "i");
-  const match = fieldRegex.exec(source);
-  if (!match) return null;
-  let i = match.index + match[0].length;
-  let out = "";
-  let escaped = false;
-  for (; i < source.length; i++) {
-    const char = source[i];
-    if (escaped) {
-      out += char;
-      escaped = false;
-      continue;
-    }
-    if (char === "\\") {
-      out += char;
-      escaped = true;
-      continue;
-    }
-    if (char === "\"") {
-      return decodeJsonStringLiteral(out);
-    }
-    out += char;
-  }
-  return decodeJsonStringLiteral(out);
-}
-
-function salvageWriteArguments(argumentsText) {
-  const filePath = extractJsonLikeStringField(argumentsText, "filePath");
-  const content = extractJsonLikeStringField(argumentsText, "content");
-  if (typeof filePath === "string" && filePath.length > 0 && typeof content === "string") {
-    return { filePath, content };
-  }
-  return null;
-}
-
 function salvageMalformedToolCalls(text) {
   const source = String(text || "");
   const calls = [];
@@ -305,10 +276,6 @@ function salvageMalformedToolCalls(text) {
         const parsedArgs = tryParseJsonLenient(argsObjectText);
         if (parsedArgs.ok) {
           argsValue = parsedArgs.value;
-        } else if (name === "write") {
-          const salvaged = salvageWriteArguments(argsObjectText);
-          if (salvaged) argsValue = salvaged;
-          else continue;
         } else if (name === "todowrite") {
           const salvaged = salvageTodowriteArguments(argsObjectText);
           if (salvaged) argsValue = salvaged;
@@ -328,124 +295,9 @@ function salvageMalformedToolCalls(text) {
   return calls.length > 0 ? calls : null;
 }
 
-function parseInlineBridgeScalar(value) {
-  const raw = String(value || "").replace(/^\s+/, "");
-  const trimmed = raw.trim();
-  if (!trimmed) return "";
-  if (trimmed === "true") return true;
-  if (trimmed === "false") return false;
-  if (trimmed === "null") return null;
-  if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) return Number(trimmed);
-  return raw;
-}
-
-function canonicalStructuredFieldName(name) {
-  const raw = String(name || "").trim();
-  const lower = raw.toLowerCase();
-  if (lower === "tool") return "name";
-  if (lower === "filepath" || lower === "file" || lower === "path" || lower === "filename") return "filePath";
-  if (lower === "oldstring") return "oldString";
-  if (lower === "newstring") return "newString";
-  return raw;
-}
-
-function isStructuredMultilineField(name) {
-  return new Set(["content", "oldString", "newString"]).has(String(name || ""));
-}
-
-function looksLikeStructuredFieldLine(line) {
-  return /^([A-Za-z_][A-Za-z0-9_-]*)\s*(<<\s*[A-Za-z0-9_-]+|:\s*[\s\S]*)$/.test(String(line || "").trim());
-}
-
-function parseStructuredCallBlock(text) {
-  const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");
-  let index = 0;
-  while (index < lines.length && !lines[index].trim()) index++;
-  if (index >= lines.length) return null;
-
-  let name = "";
-  const args = {};
-
-  while (index < lines.length) {
-    const rawLine = lines[index];
-    const line = rawLine.trim();
-    index++;
-    if (!line) continue;
-
-    const heredocMatch = /^([A-Za-z_][A-Za-z0-9_-]*)\s*<<\s*([A-Za-z0-9_-]+)\s*$/.exec(line);
-    if (heredocMatch) {
-      const field = canonicalStructuredFieldName(heredocMatch[1]);
-      const terminator = heredocMatch[2];
-      const valueLines = [];
-      while (index < lines.length && lines[index].trim() !== terminator) {
-        valueLines.push(lines[index]);
-        index++;
-      }
-      if (index < lines.length && lines[index].trim() === terminator) index++;
-      const value = valueLines.join("\n");
-      if (field === "name" || field === "tool") {
-        name = value.trim();
-      } else if (field === "args_json" || field === "arguments_json") {
-        const parsed = tryParseJsonLenient(value);
-        if (parsed.ok && parsed.value && typeof parsed.value === "object" && !Array.isArray(parsed.value)) {
-          Object.assign(args, parsed.value);
-        }
-      } else if (field.endsWith("_json")) {
-        const parsed = tryParseJsonLenient(value);
-        args[field.slice(0, -5)] = parsed.ok ? parsed.value : value;
-      } else {
-        args[field] = value;
-      }
-      continue;
-    }
-
-    const fieldMatch = /^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*([\s\S]*)$/.exec(rawLine);
-    if (!fieldMatch) continue;
-    const field = canonicalStructuredFieldName(fieldMatch[1]);
-    const rawValue = fieldMatch[2];
-    if (field === "name" || field === "tool") {
-      name = rawValue.trim();
-      continue;
-    }
-    if (field === "args_json" || field === "arguments_json") {
-      const parsed = tryParseJsonLenient(rawValue);
-      if (parsed.ok && parsed.value && typeof parsed.value === "object" && !Array.isArray(parsed.value)) {
-        Object.assign(args, parsed.value);
-      }
-      continue;
-    }
-    if (field.endsWith("_json")) {
-      const parsed = tryParseJsonLenient(rawValue);
-      args[field.slice(0, -5)] = parsed.ok ? parsed.value : parseInlineBridgeScalar(rawValue);
-      continue;
-    }
-    if (isStructuredMultilineField(field)) {
-      const valueLines = [rawValue];
-      while (index < lines.length) {
-        const nextRaw = lines[index];
-        if (looksLikeStructuredFieldLine(nextRaw)) break;
-        valueLines.push(nextRaw);
-        index++;
-      }
-      args[field] = valueLines.join("\n");
-      continue;
-    }
-    args[field] = parseInlineBridgeScalar(rawValue);
-  }
-
-  if (!name) return null;
-  return [{ name, arguments: args }];
-}
-
 function bestEffortParseToolPayload(text) {
   const source = String(text || "").trim();
   const wrappedSource = /^[{\[]/.test(source) ? source : `{${source}}`;
-
-  const structuredCalls = parseStructuredCallBlock(source);
-  if (structuredCalls) {
-    const toolCalls = normalizeParsedToolCalls(structuredCalls);
-    if (toolCalls.length > 0) return toolCalls;
-  }
 
   const parsed = tryParseJsonLenient(source);
   if (parsed.ok && parsed.value && typeof parsed.value === "object") {
@@ -633,11 +485,19 @@ function buildEmptyStopRecoveryRequest(upstreamRequest) {
   return rewritten;
 }
 
-function encodeToolCallsBlock(toolCalls) {
+function encodeToolCallsBlock(toolCalls, flavor = "default") {
   const callBlocks = toolCalls.map((call) => {
+    const parsedArgs = typeof call.function.arguments === "string"
+      ? (tryParseJson(call.function.arguments).ok ? tryParseJson(call.function.arguments).value : call.function.arguments)
+      : (call.function.arguments || {});
+    const payload = {
+      ...(flavor === "kimi"
+        ? { tool_name: call.function.name, tool_input: parsedArgs }
+        : { name: call.function.name, arguments: parsedArgs })
+    };
     return [
       CALL_MODE_MARKER,
-      encodeStructuredCallPayload(call),
+      JSON.stringify(payload, null, 2),
       CALL_MODE_END_MARKER
     ].join("\n");
   });
@@ -648,7 +508,10 @@ function encodeToolCallsBlock(toolCalls) {
   ].join("\n");
 }
 
-function encodeToolResultBlock(message) {
+function encodeToolResultBlock(message, flavor = "default") {
+  const callPayloadExample = flavor === "kimi"
+    ? `{"tool_name":"read","tool_input":{"filePath":"src/app.js"}}`
+    : `{"name":"read","arguments":{"filePath":"src/app.js"}}`;
   const payload = {
     tool_call_id: message.tool_call_id || "",
     content: contentPartsToText(message.content)
@@ -663,8 +526,11 @@ function encodeToolResultBlock(message) {
     "Continue from this tool result.",
     `Your next reply must use exactly one of these formats: ${TOOL_MODE_MARKER} ... ${TOOL_MODE_END_MARKER} or ${FINAL_MODE_MARKER} ... ${FINAL_MODE_END_MARKER}.`,
     `For tool use, only use ${CALL_MODE_MARKER} ... ${CALL_MODE_END_MARKER} blocks inside ${TOOL_MODE_MARKER}.`,
+    `Inside each CALL block, use exactly this JSON shape: ${callPayloadExample}`,
     "Do not narrate the next step in plain text.",
     "Do not say what you are about to do.",
+    "For edit calls, oldString must include enough unique surrounding context to match exactly one location.",
+    "If an edit could match multiple places, read more context first and then send a larger oldString.",
     "Do not use legacy forms like [question], [write], [read], or raw tool_calls JSON unless recovery is needed.",
     "If more than one independent tool call is needed, include multiple CALL blocks. Otherwise call the next tool immediately or give the final answer envelope.",
     "If a required detail is genuinely missing or the user must choose between materially different options, prefer the question tool instead of guessing."
@@ -674,14 +540,20 @@ function encodeToolResultBlock(message) {
 function encodeUserMessageForBridge(content, options = {}) {
   const text = typeof content === "string" ? content : "";
   const firstTurn = Boolean(options.firstTurn);
+  const flavor = options.flavor || "default";
+  const callPayloadExample = flavor === "kimi"
+    ? `{"tool_name":"read","tool_input":{"filePath":"src/app.js"}}`
+    : `{"name":"read","arguments":{"filePath":"src/app.js"}}`;
   return [
     text,
     "",
     "Protocol requirements for your next reply:",
     `- Start with ${TOOL_MODE_MARKER} or ${FINAL_MODE_MARKER}.`,
     `- If you need to inspect, search, read, edit, write, or plan work, reply with ${TOOL_MODE_MARKER}.`,
-    `- Inside ${TOOL_MODE_MARKER}, only use ${CALL_MODE_MARKER} ... ${CALL_MODE_END_MARKER}.`,
-    "- Preferred CALL format is field-based: name line plus argument lines. Use HEREDOC blocks for long text fields like content, oldString, and newString.",
+    `- Inside ${TOOL_MODE_MARKER}, only use ${CALL_MODE_MARKER} JSON ${CALL_MODE_END_MARKER}.`,
+    `- Inside each CALL block, use exactly this JSON shape: ${callPayloadExample}`,
+    "- For edit, use an oldString with enough unique surrounding context to match exactly one place.",
+    "- If an edit target is ambiguous, read more context first instead of guessing a short oldString.",
     "- If you genuinely need clarification before acting, prefer the question tool instead of guessing.",
     "- Do not use [question], [write], [read], or any other bracketed legacy tool format.",
     "- Do not narrate what you are about to do in plain text.",
@@ -691,8 +563,17 @@ function encodeUserMessageForBridge(content, options = {}) {
   ].join("\n");
 }
 
-function buildBridgeSystemMessage(tools) {
+function buildBridgeSystemMessage(tools, flavor = "default") {
   const catalog = compactToolCatalog(tools);
+  const callExample = flavor === "kimi"
+    ? { tool_name: "tool_name", tool_input: { example: true } }
+    : { name: "tool_name", arguments: { example: true } };
+  const validReadExample = flavor === "kimi"
+    ? { tool_name: "read", tool_input: { filePath: "src/app.js" } }
+    : { name: "read", arguments: { filePath: "src/app.js" } };
+  const validReadExample2 = flavor === "kimi"
+    ? { tool_name: "read", tool_input: { filePath: "src/styles.css" } }
+    : { name: "read", arguments: { filePath: "src/styles.css" } };
   return [
     "Tool bridge mode is enabled.",
     "The upstream provider's native tool calling is disabled for this request.",
@@ -705,27 +586,25 @@ function buildBridgeSystemMessage(tools) {
     "Tool format example:",
     TOOL_MODE_MARKER,
     CALL_MODE_MARKER,
-    "name: tool_name",
-    "example_json: true",
+    JSON.stringify(callExample, null, 2),
     CALL_MODE_END_MARKER,
     TOOL_MODE_END_MARKER,
-    "Inside the tool envelope, emit one or more CALL blocks. Each CALL block contains one tool call.",
+    "Inside the tool envelope, emit one or more CALL blocks. Each CALL block contains one tool call as JSON.",
     "Rules for tool use:",
     `- Output ${TOOL_MODE_MARKER} first and ${TOOL_MODE_END_MARKER} last.`,
     `- For each tool call, wrap it in ${CALL_MODE_MARKER} and ${CALL_MODE_END_MARKER}.`,
-    "- Preferred CALL body format is line-based fields, not a giant escaped JSON string.",
-    "- Use name: TOOL_NAME on the first non-empty line of each CALL block.",
-    "- Use ARGUMENT_NAME: value for short scalar arguments.",
-    "- Use ARGUMENT_NAME<<TAG ... TAG for long multiline text fields like content, oldString, and newString.",
-    "- For nested or non-string arguments, use field_json: VALUE or field_json<<TAG ... TAG with valid JSON.",
-    "- The older JSON CALL body shape is still accepted as a compatibility fallback. Prefer the field-based format.",
     "- Do not use markdown code fences for tool replies.",
     "- Do not write any explanatory prose before, inside, or after the tool envelope.",
     "- Do not use legacy bracketed formats like [question], [write], [read], or [toolname].",
     "- Do not output raw tool_calls JSON unless recovery is needed; CALL blocks are the required format.",
+    flavor === "kimi"
+      ? "- For Kimi, each CALL JSON object must use tool_name and tool_input. Do not use name/arguments."
+      : "- Each CALL JSON object must use name and arguments. Do not use tool_name/tool_input.",
     "- Emit one or more tool calls only when they are independent and can be executed in parallel or as a batch.",
     "- If several reads/searches are needed immediately, include multiple CALL blocks in the same tool envelope.",
     "- If sequencing matters, emit only the next required tool call.",
+    "- For edit, oldString must be unique in the target file. Include enough surrounding context to identify one location.",
+    "- If edit would likely match multiple locations, read more of the file first and then retry with a larger oldString.",
     "- If important clarification is missing, use the question tool instead of inventing requirements.",
     "- After each tool result, decide the next tool call or CALL batch.",
     "- On the first assistant turn for a coding task, usually call a search/read/list tool first.",
@@ -740,29 +619,16 @@ function buildBridgeSystemMessage(tools) {
     "Valid response example:",
     TOOL_MODE_MARKER,
     CALL_MODE_MARKER,
-    "name: read",
-    "filePath: src/app.js",
+    JSON.stringify(validReadExample, null, 2),
     CALL_MODE_END_MARKER,
     TOOL_MODE_END_MARKER,
     "Valid multi-tool example:",
     TOOL_MODE_MARKER,
     CALL_MODE_MARKER,
-    "name: read",
-    "filePath: src/app.js",
+    JSON.stringify(validReadExample, null, 2),
     CALL_MODE_END_MARKER,
     CALL_MODE_MARKER,
-    "name: read",
-    "filePath: src/styles.css",
-    CALL_MODE_END_MARKER,
-    TOOL_MODE_END_MARKER,
-    "Valid large write example:",
-    TOOL_MODE_MARKER,
-    CALL_MODE_MARKER,
-    "name: write",
-    "filePath: src/app.js",
-    "content<<CONTENT",
-    "console.log('hello');",
-    "CONTENT",
+    JSON.stringify(validReadExample2, null, 2),
     CALL_MODE_END_MARKER,
     TOOL_MODE_END_MARKER,
     `If you are giving a final answer to the user and no tool is needed, use this exact envelope:`,
@@ -779,11 +645,12 @@ function buildBridgeSystemMessage(tools) {
   ].join("\n\n");
 }
 
-function translateMessagesForBridge(messages, tools) {
+function translateMessagesForBridge(messages, tools, modelId) {
   const out = [];
   let bridgeInserted = false;
   let firstUserSeen = false;
-  const bridgeSystem = { role: "system", content: buildBridgeSystemMessage(tools) };
+  const flavor = getBridgeFlavor(modelId);
+  const bridgeSystem = { role: "system", content: buildBridgeSystemMessage(tools, flavor) };
 
   for (const message of messages || []) {
     if (message.role === "system") {
@@ -798,7 +665,7 @@ function translateMessagesForBridge(messages, tools) {
 
     if (message.role === "assistant") {
       if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
-        out.push({ role: "assistant", content: encodeToolCallsBlock(message.tool_calls).trim() });
+        out.push({ role: "assistant", content: encodeToolCallsBlock(message.tool_calls, flavor).trim() });
         continue;
       }
 
@@ -809,14 +676,14 @@ function translateMessagesForBridge(messages, tools) {
     }
 
     if (message.role === "tool") {
-      out.push({ role: "user", content: encodeToolResultBlock(message).trim() });
+      out.push({ role: "user", content: encodeToolResultBlock(message, flavor).trim() });
       continue;
     }
 
     if (message.role === "user") {
       out.push({
         role: "user",
-        content: encodeUserMessageForBridge(contentPartsToText(message.content), { firstTurn: !firstUserSeen })
+        content: encodeUserMessageForBridge(contentPartsToText(message.content), { firstTurn: !firstUserSeen, flavor })
       });
       firstUserSeen = true;
       continue;
@@ -842,7 +709,7 @@ function transformRequestForBridge(body) {
 
   const normalized = normalizeTools(rewritten.tools);
   changes.push(...normalized.changes);
-  rewritten.messages = translateMessagesForBridge(rewritten.messages, normalized.tools);
+  rewritten.messages = translateMessagesForBridge(rewritten.messages, normalized.tools, rewritten.model);
   rewritten.tool_choice = undefined;
   rewritten.parallel_tool_calls = undefined;
   if (typeof rewritten.temperature !== "number" || rewritten.temperature > 0.2) {
@@ -870,48 +737,6 @@ function transformRequestForBridge(body) {
 
 function generateToolCallId() {
   return `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
-}
-
-function pickHeredocTerminator(text, base) {
-  const source = String(text || "");
-  let candidate = base;
-  let counter = 1;
-  while (source.includes(`\n${candidate}\n`) || source.endsWith(`\n${candidate}`) || source === candidate) {
-    counter++;
-    candidate = `${base}_${counter}`;
-  }
-  return candidate;
-}
-
-function encodeStructuredCallPayload(call) {
-  const exactTextFields = new Set(["content", "oldString", "newString"]);
-  const args = typeof call.function.arguments === "string"
-    ? (tryParseJson(call.function.arguments).ok ? tryParseJson(call.function.arguments).value : {})
-    : (call.function.arguments || {});
-  const lines = [`name: ${call.function.name}`];
-  for (const [key, value] of Object.entries(args || {})) {
-    if (typeof value === "string") {
-      if (exactTextFields.has(key) || value.includes("\n") || value.length > 160 || /^\s|\s$/.test(value)) {
-        const terminator = pickHeredocTerminator(value, key.toUpperCase());
-        lines.push(`${key}<<${terminator}`);
-        lines.push(value);
-        lines.push(terminator);
-      } else {
-        lines.push(`${key}: ${value}`);
-      }
-      continue;
-    }
-    if (value && typeof value === "object") {
-      const encoded = JSON.stringify(value, null, 2);
-      const terminator = pickHeredocTerminator(encoded, `${key.toUpperCase()}_JSON`);
-      lines.push(`${key}_json<<${terminator}`);
-      lines.push(encoded);
-      lines.push(terminator);
-      continue;
-    }
-    lines.push(`${key}_json: ${JSON.stringify(value)}`);
-  }
-  return lines.join("\n");
 }
 
 function extractFencedBlock(text, label) {
@@ -1032,13 +857,58 @@ function stripCodeFenceMarkers(text) {
 function normalizeEmbeddedPayloadShape(value) {
   if (!value) return null;
 
+  const normalizeArgumentKey = (key) => {
+    const raw = String(key || "");
+    const lower = raw.toLowerCase();
+    if (lower === "path" || lower === "file" || lower === "filepath" || lower === "file_path" || lower === "filename") return "filePath";
+    if (lower === "oldstring" || lower === "old_string") return "oldString";
+    if (lower === "newstring" || lower === "new_string") return "newString";
+    return raw;
+  };
+
   const legacyArgsFromValue = (item) => {
     const args = {};
+    const reserved = new Set([
+      "name",
+        "tool",
+        "tool_name",
+        "function",
+        "params",
+        "tool_input",
+        "arguments",
+        "tool_calls",
+        "tool_call",
+        "call",
+        "action",
+      "calls",
+      "actions",
+      "tools",
+      "invocations",
+      "content",
+      "final",
+      "answer",
+      "response"
+    ]);
     if (item && item.params && typeof item.params === "object" && !Array.isArray(item.params)) {
-      Object.assign(args, item.params);
+      for (const [key, value] of Object.entries(item.params)) {
+        args[normalizeArgumentKey(key)] = value;
+      }
+    }
+    if (item && item.tool_input && typeof item.tool_input === "object" && !Array.isArray(item.tool_input)) {
+      for (const [key, value] of Object.entries(item.tool_input)) {
+        args[normalizeArgumentKey(key)] = value;
+      }
     }
     if (item && item.arguments && typeof item.arguments === "object" && !Array.isArray(item.arguments)) {
-      Object.assign(args, item.arguments);
+      for (const [key, value] of Object.entries(item.arguments)) {
+        args[normalizeArgumentKey(key)] = value;
+      }
+    }
+    if (item && typeof item === "object") {
+      for (const [key, value] of Object.entries(item)) {
+        if (reserved.has(key)) continue;
+        args[normalizeArgumentKey(key)] = value;
+      }
     }
     if (item && typeof item.purpose === "string" && args.purpose === undefined) {
       args.purpose = item.purpose;
@@ -1052,6 +922,7 @@ function normalizeEmbeddedPayloadShape(value) {
       .map((item) => {
         if (typeof item.name === "string") return { name: item.name, arguments: item.arguments || {} };
         if (typeof item.tool === "string") return { name: item.tool, arguments: legacyArgsFromValue(item) };
+        if (typeof item.tool_name === "string") return { name: item.tool_name, arguments: legacyArgsFromValue(item) };
         if (item.function && typeof item.function.name === "string") {
           return { name: item.function.name, arguments: item.function.arguments || {} };
         }
@@ -1071,6 +942,12 @@ function normalizeEmbeddedPayloadShape(value) {
   if (typeof value.tool === "string") {
     return {
       name: value.tool,
+      arguments: legacyArgsFromValue(value)
+    };
+  }
+  if (typeof value.tool_name === "string") {
+    return {
+      name: value.tool_name,
       arguments: legacyArgsFromValue(value)
     };
   }
@@ -1136,13 +1013,22 @@ function parseAnyFencedJsonPayload(text) {
 }
 
 function normalizeParsedToolCalls(rawCalls) {
+  const normalizeToolName = (name) => {
+    const raw = String(name || "").trim();
+    const lower = raw.toLowerCase();
+    if (lower === "shell" || lower === "sh" || lower === "terminal" || lower === "command" || lower === "commandline" || lower === "powershell") {
+      return "bash";
+    }
+    return raw;
+  };
+
   return rawCalls
     .filter((call) => call && typeof call === "object" && typeof call.name === "string")
     .map((call) => ({
       id: generateToolCallId(),
       type: "function",
       function: {
-        name: call.name,
+        name: normalizeToolName(call.name),
         arguments: normalizeJsonString(call.arguments || {})
       }
     }));
@@ -1188,8 +1074,53 @@ function stripLeadingMarkerJunk(text) {
   return String(text || "").replace(/^\s*[\]\}\),;:]+\s*/, "");
 }
 
+function stripTrailingFinalMarkerFragment(text) {
+  const source = String(text || "");
+  let bestCut = source.length;
+
+  const canonicalCandidates = [
+    "[[OPENCODE_FINAL]]",
+    "[[/OPENCODE_FINAL]]",
+    "[OPENCODE_FINAL]",
+    "[/OPENCODE_FINAL]"
+  ];
+
+  for (const marker of canonicalCandidates) {
+    for (let i = 1; i < marker.length; i++) {
+      const fragment = marker.slice(0, i);
+      if (source.endsWith(fragment)) {
+        bestCut = Math.min(bestCut, source.length - fragment.length);
+      }
+    }
+  }
+
+  const malformedMatch = source.match(/(?:\[\s*){1,4}\/?\[?\s*\/?\s*OPENCODE_FINAL\s*\]?\]?$/i);
+  if (malformedMatch) {
+    bestCut = Math.min(bestCut, malformedMatch.index);
+  }
+
+  return bestCut === source.length ? source : source.slice(0, bestCut);
+}
+
+function stripAllTrailingFinalMarkerJunk(text) {
+  let out = String(text || "");
+  while (true) {
+    const trimmed = out
+      .replace(/\s*\[\[\/\[\s*OPENCODE_FINAL\]\s*$/i, "")
+      .replace(/\s*\[\[\/OPENCODE_FINAL\]?\s*$/i, "")
+      .replace(/\s*\[\/OPENCODE_FINAL\]?\s*$/i, "")
+      .replace(/\s*\[\[OPENCODE_FINAL\]?\s*$/i, "");
+    const cleaned = stripTrailingFinalMarkerFragment(trimmed);
+    if (cleaned === out) return out;
+    out = cleaned;
+  }
+}
+
 function normalizeBridgeMarkers(text) {
   let source = String(text || "");
+  source = source.replace(/\[\s*\/+\s*\[\s*OPENCODE_TOOLS?\s*\]?\]?/gi, TOOL_MODE_END_MARKER);
+  source = source.replace(/\[\s*\/+\s*\[\s*OPENCODE_FINAL\s*\]?\]?/gi, FINAL_MODE_END_MARKER);
+  source = source.replace(/\[\s*\/+\s*\[\s*CALL\s*\]?\]?/gi, CALL_MODE_END_MARKER);
   source = source.replace(/\[?\[?\s*OPENCODE_TOOLS?\s*\]?\]?/gi, TOOL_MODE_MARKER);
   source = source.replace(/\[?\[?\s*\/\s*OPENCODE_TOOLS?\s*\]?\]?/gi, TOOL_MODE_END_MARKER);
   source = source.replace(/\[?\[?\s*OPENCODE_FINAL\s*\]?\]?/gi, FINAL_MODE_MARKER);
@@ -1558,7 +1489,7 @@ function buildBridgeResultFromText(text, reasoning) {
     kind: "final",
     message: {
       role: "assistant",
-      content: stripLeadingMarkerJunk(parsed.kind === "final" ? parsed.content : (parsed.content || text || "")),
+      content: stripAllTrailingFinalMarkerJunk(stripLeadingMarkerJunk(parsed.kind === "final" ? parsed.content : (parsed.content || text || ""))),
       reasoning_content: reasoning || ""
     },
     finishReason: "stop"
@@ -1618,7 +1549,8 @@ function extractStreamableFinalContent(content) {
     ? stripMarker(source, FINAL_MODE_MARKER)
     : source;
   const endIndex = withoutStart.indexOf(FINAL_MODE_END_MARKER);
-  return stripLeadingMarkerJunk(endIndex === -1 ? withoutStart : withoutStart.slice(0, endIndex));
+  const visible = endIndex === -1 ? withoutStart : withoutStart.slice(0, endIndex);
+  return stripAllTrailingFinalMarkerJunk(stripLeadingMarkerJunk(visible));
 }
 
 function buildSSEFromBridge(aggregate) {
@@ -1948,7 +1880,7 @@ async function proxyRequest(req, res) {
     if (!roleSent) ensureRole(aggregate);
     const result = buildBridgeResultFromText(aggregate.content, aggregate.reasoning);
     if (result.kind === "final") {
-      const finalText = result.message.content || "";
+      const finalText = extractStreamableFinalContent(aggregate.content) || result.message.content || "";
       if (finalText) {
         res.write(sseLine({
           id: aggregate.id || `chatcmpl_${randomUUID()}`,
