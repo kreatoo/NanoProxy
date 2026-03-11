@@ -48,6 +48,35 @@ node server.js
 
 You only need those environment variables if you want to change the defaults. Normally, `node server.js` is enough.
 
+## Docker
+
+If you do not want to run Node directly, you can run the proxy in Docker instead.
+
+Build and run with Docker:
+
+```powershell
+docker build -t nano-proxy .
+docker run --rm -p 8787:8787 nano-proxy
+```
+
+Or use Docker Compose:
+
+```powershell
+docker compose up --build
+```
+
+This starts the proxy on:
+
+```text
+http://127.0.0.1:8787
+```
+
+The OpenCode setup stays the same:
+
+1. Create a custom OpenAI-compatible provider.
+2. Point it to `http://127.0.0.1:8787`.
+3. Put your NanoGPT API key on that custom provider.
+
 ## Optional Debug Logging
 
 Logging is off by default.
@@ -101,11 +130,7 @@ Tool use:
 ```text
 [[OPENCODE_TOOL]]
 [[CALL]]
-name: write
-filePath: a.txt
-content<<CONTENT
-hello
-CONTENT
+{"name":"write","arguments":{"filePath":"a.txt","content":"hello"}}
 [[/CALL]]
 [[/OPENCODE_TOOL]]
 ```
@@ -115,12 +140,10 @@ Multiple tool calls in one turn are also allowed when they are independent:
 ```text
 [[OPENCODE_TOOL]]
 [[CALL]]
-name: read
-filePath: src/app.js
+{"name":"read","arguments":{"filePath":"src/app.js"}}
 [[/CALL]]
 [[CALL]]
-name: read
-filePath: src/styles.css
+{"name":"read","arguments":{"filePath":"src/styles.css"}}
 [[/CALL]]
 [[/OPENCODE_TOOL]]
 ```
@@ -134,14 +157,15 @@ done
 ```
 
 6. The proxy parses that envelope and converts it into OpenAI-style `tool_calls` for OpenCode.
-7. The preferred CALL body format is field-based with heredoc-style blocks for large text payloads like `content`, `oldString`, and `newString`.
-8. Older JSON CALL bodies and the older `{"tool_calls":[...]}` shape are still accepted for compatibility.
+7. The preferred CALL body format is JSON inside each `[[CALL]]` block.
+8. Older legacy shapes like `{"tool_calls":[...]}` are still accepted for compatibility.
 
 ## Notes
 
 - Reasoning streams live.
 - Tool and final content are buffered until the proxy can classify them safely.
 - If the model returns multiple tool calls in one tool envelope, the proxy forwards them as separate tool-call chunks in the same assistant turn.
+- Some models may be forced to one tool call per turn when that is more reliable. For example, Kimi is currently handled more conservatively than GLM.
 - This means reliability is prioritized over raw token-by-token passthrough for tool turns.
 - Requests without `tools` are forwarded normally.
 - For bridged tool turns, the proxy caps upstream `temperature` and `top_p` to reduce protocol drift.

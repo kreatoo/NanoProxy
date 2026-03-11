@@ -1,0 +1,10 @@
+services:
+  nano-proxy:
+    build: .
+    ports:
+      - "8787:8787"
+    environment:
+      UPSTREAM_BASE_URL: https://nano-gpt.com/api/v1
+      PROXY_HOST: 0.0.0.0
+      PROXY_PORT: 8787
+    restart: unless-stopped
